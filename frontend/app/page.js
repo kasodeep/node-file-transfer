@@ -18,48 +18,105 @@ import {
 import { useToast } from "@/hooks/use-toast";
 
 const API_URL = "http://192.168.1.9:5000";
+const WS_URL = "ws://192.168.1.9:5001";
 
-export default function FileList() {
+export default function Home() {
   const [files, setFiles] = useState([]);
-
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
-
   const [fileToDelete, setFileToDelete] = useState(null);
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
   const { toast } = useToast();
 
-  // useEffect to fetch the files from the server.
+  // WebSocket connection
+  useEffect(() => {
+    const ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+      console.log("Connected to WebSocket server");
+    };
+
+    ws.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      if (message.type === "fileUpdate") {
+        setFiles(message.files);
+        toast({
+          title: "File list updated",
+          description: "New files have been uploaded or deleted.",
+        });
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("Disconnected from WebSocket server");
+    };
+
+    ws.onerror = (error) => {
+      console.error("WebSocket error:", error);
+      setError("Failed to connect to real-time updates");
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, []);
+
+  // Fetch initial files
   useEffect(() => {
     fetchFiles();
   }, []);
 
-  const fetchFiles = () => {
+  const fetchFiles = async () => {
     setLoading(true);
-    fetch(`${API_URL}/files`)
-      .then((res) => {
-        if (!res.ok) {
-          throw new Error("Failed to fetch files");
-        }
-        return res.json();
-      })
-      .then((data) => {
-        setFiles(data);
-      })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
+    try {
+      const res = await fetch(`${API_URL}/files`);
+      if (!res.ok) {
+        throw new Error("Failed to fetch files");
+      }
+      const data = await res.json();
+      setFiles(data);
+      setError(null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  // download files from the server.
-  const downloadFile = (filename) => {
-    window.location.href = `${API_URL}/download/${filename}`;
+  const downloadFile = async (filename) => {
+    try {
+      const res = await fetch(
+        `${API_URL}/download/${encodeURIComponent(filename)}`,
+      );
+      if (!res.ok) {
+        throw new Error("Failed to download file");
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      a.click();
+      window.URL.revokeObjectURL(url);
+      toast({
+        title: "Download started",
+        description: `${filename} is being downloaded.`,
+      });
+    } catch (err) {
+      toast({
+        title: "Download failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    }
   };
 
-  // uploading the files on the server.
-  const handleFileUpload = (event) => {
+  const handleFileUpload = async (event) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
 
+    setIsUploading(true);
     const formData = new FormData();
     for (const file of files) {
       formData.append("files", file);
@@ -70,26 +127,30 @@ export default function FileList() {
       description: "Please wait while we process your files.",
     });
 
-    fetch(`${API_URL}/upload`, {
-      method: "POST",
-      body: formData,
-    })
-      .then((res) => res.json())
-      .then((data) => {
-        setFiles((prevFiles) => [...prevFiles, ...data.filenames]);
-        toast({
-          title: "Upload successful!",
-          description: `${data.filenames.length} files uploaded.`,
-        });
-      })
-      .catch((err) => {
-        setError(err.message);
-        toast({
-          title: "Upload failed",
-          description: err.message,
-          variant: "destructive",
-        });
+    try {
+      const res = await fetch(`${API_URL}/upload`, {
+        method: "POST",
+        body: formData,
       });
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.error || "Failed to upload files");
+      }
+      const data = await res.json();
+      toast({
+        title: "Upload successful!",
+        description: `${data.filenames.length} files uploaded.`,
+      });
+    } catch (err) {
+      setError(err.message);
+      toast({
+        title: "Upload failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   const confirmDelete = (filename) => {
@@ -97,59 +158,55 @@ export default function FileList() {
     setIsDeleteDialogOpen(true);
   };
 
-  const deleteFile = () => {
+  const deleteFile = async () => {
     if (!fileToDelete) return;
 
-    fetch(`${API_URL}/delete/${fileToDelete}`, {
-      method: "DELETE",
-    })
-      .then((res) => {
-        if (!res.ok) {
-          throw new Error("Failed to delete file");
-        }
-        return res.json();
-      })
-      .then(() => {
-        setFiles((prevFiles) =>
-          prevFiles.filter((file) => file !== fileToDelete),
-        );
-        toast({
-          title: "File deleted",
-          description: `${fileToDelete} has been removed.`,
-        });
-      })
-      .catch((err) => {
-        setError(err.message);
-        toast({
-          title: "Delete failed",
-          description: err.message,
-          variant: "destructive",
-        });
-      })
-      .finally(() => {
-        setFileToDelete(null);
-        setIsDeleteDialogOpen(false);
+    try {
+      const res = await fetch(
+        `${API_URL}/delete/${encodeURIComponent(fileToDelete)}`,
+        {
+          method: "DELETE",
+        },
+      );
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.error || "Failed to delete file");
+      }
+      toast({
+        title: "File deleted",
+        description: `${fileToDelete} has been removed.`,
       });
+    } catch (err) {
+      setError(err.message);
+      toast({
+        title: "Delete failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    } finally {
+      setFileToDelete(null);
+      setIsDeleteDialogOpen(false);
+    }
   };
 
-  const getFileIcon = (fileType) => {
+  const getFileIcon = (filename) => {
+    const extension = filename.split(".").pop()?.toLowerCase() || "";
     const fileIcons = {
-      pdf: <FileIcon className="w-8 h-8 text-red-500" />, // PDF - Red
-      jpg: <FileIcon className="w-8 h-8 text-blue-400" />, // Image - Blue
+      pdf: <FileIcon className="w-8 h-8 text-red-500" />,
+      jpg: <FileIcon className="w-8 h-8 text-blue-400" />,
       jpeg: <FileIcon className="w-8 h-8 text-blue-400" />,
       png: <FileIcon className="w-8 h-8 text-blue-400" />,
       gif: <FileIcon className="w-8 h-8 text-blue-400" />,
-      docx: <FileIcon className="w-8 h-8 text-blue-600" />, // Word - Blue
-      txt: <FileIcon className="w-8 h-8 text-gray-400" />, // Text - Gray
-      java: <FileIcon className="w-8 h-8 text-orange-500" />, // Java - Orange
-      js: <FileIcon className="w-8 h-8 text-yellow-500" />, // JavaScript - Yellow
-      py: <FileIcon className="w-8 h-8 text-green-500" />, // Python - Green
-      ipynb: <FileIcon className="w-8 h-8 text-purple-500" />, // Jupyter Notebook - Purple
+      docx: <FileIcon className="w-8 h-8 text-blue-600" />,
+      txt: <FileIcon className="w-8 h-8 text-gray-400" />,
+      java: <FileIcon className="w-8 h-8 text-orange-500" />,
+      js: <FileIcon className="w-8 h-8 text-yellow-500" />,
+      py: <FileIcon className="w-8 h-8 text-green-500" />,
+      ipynb: <FileIcon className="w-8 h-8 text-purple-500" />,
     };
-
     return (
-      fileIcons[fileType] || <FileIcon className="w-8 h-8 text-yellow-300" />
-    ); // Default icon
+      fileIcons[extension] || <FileIcon className="w-8 h-8 text-yellow-300" />
+    );
   };
 
   const cardVariants = {
@@ -218,20 +275,23 @@ export default function FileList() {
           Goku Transfer
         </motion.span>
         <motion.label
-          whileHover={{ scale: 1.1, rotateZ: 2 }}
-          whileTap={{ scale: 0.9 }}
-          className="cursor-pointer bg-gradient-to-r from-yellow-400 to-orange-500 px-5 py-2.5 rounded-lg shadow-lg flex items-center space-x-2 font-bold transform perspective-500"
-          style={{
-            boxShadow: "0 10px 25px -5px rgba(0, 0, 0, 0.3)",
+          whileHover={{
+            scale: isUploading ? 1 : 1.1,
+            rotateZ: isUploading ? 0 : 2,
           }}
+          whileTap={{ scale: isUploading ? 1 : 0.9 }}
+          className={`cursor-pointer bg-gradient-to-r from-yellow-400 to-orange-500 px-5 py-2.5 rounded-lg shadow-lg flex items-center space-x-2 font-bold transform perspective-500 ${
+            isUploading ? "opacity-50 cursor-not-allowed" : ""
+          }`}
         >
           <Upload className="w-5 h-5" />
-          <span>Upload</span>
+          <span>{isUploading ? "Uploading..." : "Upload"}</span>
           <input
             type="file"
             multiple
             className="hidden"
             onChange={handleFileUpload}
+            disabled={isUploading}
           />
         </motion.label>
       </nav>
@@ -304,7 +364,7 @@ export default function FileList() {
                       <CardContent className="p-6 relative z-10">
                         <div className="flex justify-between items-start mb-4">
                           <div className="flex items-center space-x-3">
-                            {getFileIcon(file.split(".").pop())}
+                            {getFileIcon(file)}
                             <h3 className="text-xl font-bold text-yellow-300 truncate max-w-[150px]">
                               {file}
                             </h3>
