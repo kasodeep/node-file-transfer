@@ -1,5 +1,4 @@
 const express = require("express");
-
 const cors = require("cors");
 const multer = require("multer");
 
@@ -9,143 +8,164 @@ const path = require("path");
 
 const WebSocket = require("ws");
 
-/**
- * Function to get the IP address of the machine.
- */
-const getLocalIpAddress = () => {
-  const interfaces = os.networkInterfaces();
-  for (const interfaceName in interfaces) {
-    for (const iface of interfaces[interfaceName]) {
-      if (iface.family === "IPv4" && !iface.internal) {
-        return iface.address;
-      }
+// Config
+const PORT = 5000;
+const WS_PORT = 5001;
+const FILE_DIR = path.join(os.homedir(), "Desktop", "shared");
+const MAX_FILE_SIZE_MB = 500; // 500 MB max file size
+
+// Helpers
+const getLocalIp = () => {
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name]) {
+      if (iface.family === "IPv4" && !iface.internal) return iface.address;
     }
   }
   return "127.0.0.1";
 };
 
-const localIp = getLocalIpAddress();
+/** Read FILE_DIR and return an array of { name, size } objects. */
+const readFileList = () => {
+  const entries = fs.readdirSync(FILE_DIR);
+  return entries.map(name => {
+    try {
+      const stat = fs.statSync(path.join(FILE_DIR, name));
+      return { name, size: stat.size };
+    } catch {
+      return { name, size: 0 };
+    }
+  });
+};
 
-// Specifying the express app and the file directory.
+// Setup
+if (!fs.existsSync(FILE_DIR)) fs.mkdirSync(FILE_DIR, { recursive: true });
+
+// express setup
+const localIp = getLocalIp();
 const app = express();
-const FILE_DIR = path.join(os.homedir(), "Desktop", "shared");
+app.use(express.json());
 
-if (!fs.existsSync(FILE_DIR)) {
-  fs.mkdirSync(FILE_DIR, { recursive: true });
-}
+// CORS: allow local dev and LAN access
+app.use(cors({
+  origin: (_origin, cb) => cb(null, true), // allow all origins on a LAN tool
+  methods: ["GET", "POST", "DELETE"],
+}));
 
-// Setting the cors property for inter-wifi communication.
-app.use(
-  cors({
-    origin: ["http://localhost:3000", `http://${localIp}:3000`],
-    methods: ["GET", "POST", "DELETE"],
-  }),
-);
-
-// Configuration of multer for uploading the files to server.
+// multer
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, FILE_DIR);
-  },
-  filename: (req, file, cb) => {
-    cb(null, file.originalname);
-  },
+  destination: (_req, _file, cb) => cb(null, FILE_DIR),
+  filename: (_req, file, cb) => cb(null, file.originalname),
 });
 
 const upload = multer({
   storage,
-  limits: { fileSize: 500 * 1024 * 1024 }, // 10MB limit
+  limits: { fileSize: MAX_FILE_SIZE_MB * 1024 * 1024 },
 });
 
-// WebSocket server setup
-const wss = new WebSocket.Server({ port: 5001 });
+// WebSocket broadcast
+const wss = new WebSocket.Server({ port: WS_PORT });
 
 wss.on("connection", (ws) => {
-  console.log("WebSocket client connected");
-  ws.on("close", () => {
-    console.log("WebSocket client disconnected");
-  });
+  console.log("WS client connected");
+
+  // Send current file list immediately on connect
+  ws.send(JSON.stringify({ type: "fileUpdate", files: readFileList() }));
+  ws.on("close", () => console.log("WS client disconnected"));
 });
 
-// Broadcast function to notify all connected clients
-const broadcastFileUpdate = () => {
-  fs.readdir(FILE_DIR, (err, files) => {
-    if (err) {
-      console.error("Failed to read directory:", err);
-      return;
-    }
-    const message = JSON.stringify({ type: "fileUpdate", files });
-    wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(message);
-      }
-    });
-  });
-};
+function broadcast() {
+  const payload = JSON.stringify({ type: "fileUpdate", files: readFileList() });
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(payload);
+  }
+}
 
-app.get("/files", (req, res) => {
-  fs.readdir(FILE_DIR, (err, files) => {
-    if (err) {
-      return res.status(500).send("Unable to list files!");
-    }
-    res.status(200).json(files);
-  });
+// Routes
+
+/** GET /files → [{ name, size }] */
+app.get("/files", (_req, res) => {
+  try {
+    res.json(readFileList());
+  } catch (err) {
+    res.status(500).json({ error: "Unable to list files" });
+  }
 });
 
+/** POST /upload — multipart, up to 30 files */
 app.post("/upload", upload.array("files", 30), (req, res) => {
-  if (!req.files || req.files.length === 0) {
-    return res.status(400).send("No files uploaded!");
+  if (!req.files?.length) return res.status(400).json({ error: "No files uploaded" });
+  broadcast();
+  res.json({
+    message: "Files uploaded successfully",
+    filenames: req.files.map(f => f.filename),
+  });
+});
+
+/** GET /download/:filename */
+app.get("/download/:filename", (req, res) => {
+  const name = path.basename(req.params.filename); // prevent path traversal
+  const filePath = path.join(FILE_DIR, name);
+
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
+
+  res.download(filePath, name, (err) => {
+    if (err && !res.headersSent) res.status(500).json({ error: "Download failed" });
+  });
+});
+
+/** DELETE /delete/:filename — single file */
+app.delete("/delete/:filename", (req, res) => {
+  const name = path.basename(req.params.filename);
+  const filePath = path.join(FILE_DIR, name);
+
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
+
+  try {
+    fs.unlinkSync(filePath);
+    broadcast();
+    res.json({ message: "File deleted successfully" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to delete file" });
+  }
+});
+
+/**
+ * DELETE /bulk-delete — delete multiple files atomically.
+ * Body: { filenames: string[] }
+ * Returns: { deleted: string[], failed: string[] }
+ */
+app.delete("/bulk-delete", (req, res) => {
+  const { filenames } = req.body;
+
+  if (!Array.isArray(filenames) || filenames.length === 0) {
+    return res.status(400).json({ error: "filenames array is required" });
   }
 
-  // Notify all connected clients of the file update
-  broadcastFileUpdate();
+  const deleted = [];
+  const failed = [];
 
-  res.status(200).json({
-    message: "Files uploaded successfully!",
-    filenames: req.files.map((file) => file.filename),
-  });
-});
-
-app.get("/download/:filename", (req, res) => {
-  const fileName = path.basename(req.params.filename); // Prevent path traversal
-  const filePath = path.join(FILE_DIR, fileName);
-
-  fs.access(filePath, fs.constants.F_OK, (err) => {
-    if (err) {
-      return res.status(404).json({ error: "File not found!" });
+  for (const raw of filenames) {
+    const name = path.basename(raw); // sanitise each name
+    const filePath = path.join(FILE_DIR, name);
+    try {
+      if (!fs.existsSync(filePath)) throw new Error("not found");
+      fs.unlinkSync(filePath);
+      deleted.push(name);
+    } catch {
+      failed.push(name);
     }
-    res.download(filePath, fileName, (err) => {
-      if (err) {
-        res.status(500).json({ error: "Failed to download file!" });
-      }
-    });
-  });
+  }
+
+  if (deleted.length > 0) broadcast();
+
+  const status = failed.length === 0 ? 200 : failed.length === filenames.length ? 500 : 207;
+  res.status(status).json({ deleted, failed });
 });
 
-app.delete("/delete/:filename", (req, res) => {
-  const fileName = path.basename(req.params.filename);
-  const filePath = path.join(FILE_DIR, fileName);
-
-  fs.access(filePath, fs.constants.F_OK, (err) => {
-    if (err) {
-      return res.status(404).json({ error: "File not found!" });
-    }
-
-    fs.unlink(filePath, (err) => {
-      if (err) {
-        return res.status(500).json({ error: "Failed to delete file!" });
-      }
-
-      // Notify all connected clients of the file update
-      broadcastFileUpdate();
-
-      res.status(200).json({ message: "File deleted successfully!" });
-    });
-  });
-});
-
-const PORT = 5000;
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`Server running at http://${localIp}:${PORT}`);
-  console.log(`WebSocket server running at ws://${localIp}:5001`);
+  console.log(`HTTP  → http://${localIp}:${PORT}`);
+  console.log(`WS    → ws://${localIp}:${WS_PORT}`);
+  console.log(`Files → ${FILE_DIR}`);
 });
